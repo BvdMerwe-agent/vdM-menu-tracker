@@ -1,0 +1,22 @@
+# Database (contains household data)
+menu.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated exports (can be regenerated)
+exports/
+*.xlsx
