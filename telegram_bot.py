@@ -1,241 +1,337 @@
 #!/usr/bin/env python3
 """
-Floor Telegram Menu Bot — standalone handler for /menu, /shopping, /pantry, /recipe, /ate
-Runs via cron or can be triggered by the Hermes gateway webhook system.
+Telegram bot script for Floor's kitchen commands.
+Called by the Hermes gateway cron or manually for quick testing.
+Reads TELEGRAM_BOT_TOKEN and TELEGRAM_HOME_CHANNEL from environment.
+Outputs MarkdownV2 formatted messages to stdout (Hermes picks these up via cron deliver=origin).
+Also provides direct-send mode.
 """
 import os
 import sys
-import json
 import sqlite3
-import argparse
-import datetime
+import random
 from pathlib import Path
 
-# --- locate the menu tracker DB ----
-TRACKER_DIR = Path(__file__).parent
-DB_PATH = TRACKER_DIR / "menu.db"
-CORE_PATH = TRACKER_DIR / "core.py"
+# Ensure imports work when run from any cwd
+sys.path.insert(0, str(Path(__file__).parent))
+from core import (
+    get_conn, get_active_plan, get_current_week_number, get_plan_week,
+    get_week_menu, generate_shopping_list, fmt_week_menu, fmt_shopping_list,
+    fmt_expiring, fmt_pantry_summary, get_recipe, list_expiring,
+    add_pantry_item, log_meal,
+    # New curated week functions
+    get_collecting_week, add_meal_to_collection, remove_meal_from_collection,
+    get_curated_pool, shuffle_and_schedule, get_curated_schedule,
+    fmt_curated_pool, fmt_curated_schedule, advance_week,
+    list_all_recipes_for_selection,
+)
+import datetime
 
-if CORE_PATH.exists():
-    sys.path.insert(0, str(TRACKER_DIR))
-    from core import (
-        get_active_plan, get_current_week_number, get_plan_week,
-        get_week_menu, generate_shopping_list, get_shopping_list,
-        fmt_week_menu, fmt_shopping_list, fmt_pantry_summary, fmt_expiring,
-        mark_bought, mark_shopped, mark_meal_cooked, log_meal, list_expiring,
-        get_recipe, list_recipes, add_pantry_item,
-        DB_PATH as CORE_DB_PATH,
-    )
-else:
-    raise RuntimeError("core.py not found")
 
-# ---- telegram util -------------------------------------------------------------
-TOKEN=os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN_FLOOR")
-CHAT = os.getenv("TELEGRAM_HOME_CHANNEL")
-
-def send_msg(text: str, chat_id: str = None) -> dict:
+def send(msg: str, chat_id: str = None):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat = chat_id or os.getenv("TELEGRAM_HOME_CHANNEL")
+    if not token:
+        print(msg, flush=True)
+        return
     import urllib.request, urllib.parse
-    cid = chat_id or CHAT
-    if not TOKEN or not cid:
-        print("Missing token or chat id")
-        return {}
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = urllib.parse.urlencode({
-        "chat_id": cid,
-        "text": text,
-        "parse_mode": "Markdown",
+        "chat_id": chat,
+        "text": msg,
+        "parse_mode": "MarkdownV2",
+        "disable_web_page_preview": "True"
     }).encode()
-    req = urllib.request.Request(url, data=data, method="POST",
-                                  headers={"Content-Type": "application/x-www-form-urlencoded"})
+    req = urllib.request.Request(url, data=data, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
+        urllib.request.urlopen(req, timeout=10)
     except Exception as e:
-        print(f"Send failed: {e}")
-        return {}
+        print(f"⚠️ Telegram error: {e}")
+        print(msg, flush=True)
 
-# ---- commands -------------------------------------------------------------
-def cmd_menu(args):
+
+def escape_md(text: str) -> str:
+    for ch in "_-[]()~`>#+=|{}.!\\":
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def remind():
+    """Daily menu reminder — shows today's curated meals OR old plan fallback."""
+    # Try curated schedule first
+    schedule = get_curated_schedule()
+    today = datetime.date.today().weekday()  # Monday=0
+    
+    if schedule:
+        day_meals = [m for m in schedule if m.get("scheduled_day") == today]
+        if day_meals:
+            DAYS = ["Maandag", "Dinsdag", "Woensdag", "Donderdag", "Vrijdag", "Zaterdag", "Zondag"]
+            lines = [f"📆 *Vandaag ({DAYS[today]})*\n"]
+            for m in day_meals:
+                icon = "🥪" if m["meal_type"] == "lunch" else "🍽"
+                status = " ✅" if m.get("cooked") else ""
+                name = escape_md(m.get("recipe_name") or "TBD")
+                lines.append(f"{icon} *{name}*{status}")
+            
+            # Expiry alert
+            exp = list_expiring(2)
+            if exp:
+                lines.append(f"\n⚠️ *Pas op:*")
+                for item in exp:
+                    lines.append(f"  • {escape_md(item['ingredient_name'])} — nog {int(item['days_left'])} dag{'en' if item['days_left'] != 1 else ''}")
+            
+            msg = "\n".join(lines)
+            print(msg)
+            return
+    
+    # Fallback to old 12-week plan
     plan = get_active_plan()
     if not plan:
-        return "❌ No active meal plan."
-    week = args.week or get_current_week_number(plan["id"])
-    return fmt_week_menu(week, plan["id"])
-
-def cmd_shopping(args):
-    plan = get_active_plan()
-    if not plan:
-        return "❌ No active meal plan."
-    if args.list_id:
-        # Show existing list
-        return fmt_shopping_list(args.list_id)
-    week = args.week or get_current_week_number(plan["id"])
-    week_id = get_plan_week(plan["id"], week)
-    lid = generate_shopping_list(week_id)
-    return f"🛒 *Shopping List for Week {week}* (ID: `{lid}`)\n\n" + fmt_shopping_list(lid)
-
-def cmd_pantry(args):
-    if args.expiring:
-        return fmt_expiring()
-    return fmt_pantry_summary()
-
-def cmd_recipe(args):
-    if args.query:
-        results = list_recipes(tags=args.query)
-        if not results:
-            return f"🔍 No recipes found for '{args.query}'."
-        lines = [f"🔍 *Recipes matching '{args.query}'*", ""]
-        for r in results:
-            tags = f" ({r['tags']})" if r["tags"] else ""
-            lines.append(f"• [{r['id']}] {r['name']}{tags} — {r['type']}")
-        return "\n".join(lines)
-    if args.id:
-        r = get_recipe(args.id)
-        if not r:
-            return "❌ Recipe not found."
-        lines = [f"🍳 *{r.name}* ({r.cuisine})", f"_{r.tags}_" if r.tags else "", "",
-                 f"⏱ Prep: {r.prep_time}m | Cook: {r.cook_time}m | Servings: {r.servings}",
-                 f"🥗 {r.type.title()} | Difficulty: {r.difficulty}", ""]
-        if r.ingredients:
-            lines.append("*Ingredients:*")
-            for ing in r.ingredients:
-                opt = " _(optional)_" if ing["optional"] else ""
-                note = f" — {ing['prep_note']}" if ing.get("prep_note") else ""
-                lines.append(f"• {ing['quantity']:.1f} {ing['unit']} {ing['ingredient_name']}{opt}{note}")
-        if r.notes:
-            lines.append(f"\n📝 {r.notes}")
-        return "\n".join(lines)
-    # List all
-    results = list_recipes(type_=args.type) if args.type else list_recipes()
-    lines = ["📖 *Recipes:*", ""]
-    for r in results:
-        lines.append(f"[{r['id']}] {r['name']} ({r['type']})")
-    return "\n".join(lines)
-
-def cmd_ate(args):
-    date = args.date or datetime.date.today().isoformat()
-    meal_type = args.meal or "dinner"
-    if args.recipe_id:
-        r = get_recipe(args.recipe_id)
-        if r:
-            log_meal(date, meal_type, recipe_id=r.id, servings_eaten=args.servings or 1, rating=args.rating)
-            return f"✅ Logged {r.name} for {meal_type} on {date}."
-    return "Usage: ate --recipe-id <id> [--meal lunch|dinner] [--date YYYY-MM-DD] [--servings N] [--rating 1-5]"
-
-def cmd_buy(args):
-    if args.list_id and args.mark_done:
-        mark_shopped(args.list_id)
-        return f"✅ Shopping list {args.list_id} marked as done. Items added to pantry."
-    if args.item_id:
-        mark_bought(args.item_id)
-        return f"☑️ Item {args.item_id} marked bought."
-    return "Usage: buy --item-id <id> | --list-id <id> --mark-done"
-
-def cmd_remind(args):
-    """Daily meal reminder — sends upcoming meals for today."""
-    plan = get_active_plan()
-    if not plan:
-        return "❌ No active meal plan."
+        print("Geen actief weekmenu gevonden.")
+        return
     week = get_current_week_number(plan["id"])
-    menu = get_week_menu(plan["id"], week)
-    today = datetime.date.today()
-    dow_map = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
-    day_name = dow_map[today.weekday()]
-    dm = menu.get(day_name, {})
-    lines = [f"📆 *Vandaag ({day_name} — Week {week})*", ""]
-    if dm.get("lunch"):
-        l = dm["lunch"]
-        cooked = " ✅" if l.get("cooked") else ""
-        lines.append(f"🥪 Lunch: *{l['recipe_name']}*{cooked}")
-    if dm.get("dinner"):
-        d = dm["dinner"]
-        cooked = " ✅" if d.get("cooked") else ""
-        lines.append(f"🍽 Dinner: *{d['recipe_name']}*{cooked}")
-    if not dm.get("lunch") and not dm.get("dinner"):
-        lines.append("Nothing planned today.")
-    # Expiry alert inline
-    exp = list_expiring(2)
-    if exp:
-        lines.append("")
-        lines.append("⚠️ *Expiring in 2 days:*")
-        for e in exp:
-            lines.append(f"• {e['ingredient_name']} ({e['days_left']}d left)")
-    return "\n".join(lines)
+    msg = fmt_week_menu(week, plan["id"])
+    # Crop to just today
+    for day_label in ["Maandag", "Dinsdag", "Woensdag", "Donderdag", "Vrijdag", "Zaterdag", "Zondag"]:
+        if day_label in msg:
+            today_idx = msg.index(day_label)
+            end = msg.find("\n\n", today_idx)
+            if end == -1:
+                end = len(msg)
+            print(msg[today_idx:end])
+            return
+    print(msg)
 
-def cmd_weekly(args):
-    """Generate and send the weekly shopping list + menu overview."""
+
+def weekly():
+    """Weekly overview — shows full week menu OR pool status."""
+    # Try curated first
+    schedule = get_curated_schedule()
+    if schedule:
+        print(fmt_curated_schedule())
+        return
+    
+    # Fallback to old plan
     plan = get_active_plan()
     if not plan:
-        return "❌ No active meal plan."
-    week = args.week or get_current_week_number(plan["id"])
+        print("Geen actief weekmenu gevonden.")
+        return
+    week = get_current_week_number(plan["id"])
+    print(fmt_week_menu(week, plan["id"]))
+
+
+def shopping():
+    """Generate shopping list from old plan."""
+    plan = get_active_plan()
+    if not plan:
+        print("Geen actief weekmenu gevonden.")
+        return
+    week = get_current_week_number(plan["id"])
     week_id = get_plan_week(plan["id"], week)
     lid = generate_shopping_list(week_id)
-    msg = f"🛒 *Week {week} Shopping List*\n\n"
-    msg += fmt_week_menu(week, plan["id"]) + "\n"
-    msg += "━"*30 + "\n\n"
-    msg += fmt_shopping_list(lid)
-    msg += f"\n\n_List ID: `{lid}` — reply with_ `/buy --list-id {lid} --mark-done` _when shopped._"
-    return msg
+    print(fmt_shopping_list(lid))
 
-# ---- main ------------------------------------------------------------------
-COMMANDS = {
-    "menu": cmd_menu,
-    "shopping": cmd_shopping,
-    "pantry": cmd_pantry,
-    "recipe": cmd_recipe,
-    "ate": cmd_ate,
-    "buy": cmd_buy,
-    "remind": cmd_remind,
-    "weekly": cmd_weekly,
-}
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Floor Menu Tracker CLI / Telegram backend")
+def collect():
+    """Show the current curated pool status — what's collected so far."""
+    print(fmt_curated_pool())
+
+
+def suggest(meal_type: str = None, cuisine: str = None):
+    """Suggest recipes for collection."""
+    recipes = list_all_recipes_for_selection(meal_type=meal_type, tag_filter=cuisine)
+    if not recipes:
+        print(f"Geen recepten gevonden voor {meal_type or 'alle'}.")
+        return
+    
+    lines = [f"🍳 *Kies een {meal_type or 'gerecht'}*\n"]
+    for i, r in enumerate(recipes[:15], 1):
+        tags = f" ({r['tags']})" if r['tags'] else ""
+        lines.append(f"  {i}. {escape_md(r['name'])}{escape_md(tags)}")
+    
+    lines.append(f"\n_Je hebt nu {len(recipes)} opties. Zeg het nummer of de naam om toe te voegen._")
+    print("\n".join(lines))
+
+
+def add_to_pool(recipe_id: int, meal_type: str):
+    """Add a specific recipe to the collecting pool."""
+    result = add_meal_to_collection(recipe_id, meal_type)
+    if result["success"]:
+        # Get recipe name
+        r = get_recipe(recipe_id)
+        name = r["name"] if r else f"recept #{recipe_id}"
+        print(f"✅ *{escape_md(name)}* toegevoegd als {meal_type}.")
+        print(f"{result['total']}/14 maaltijden verzameld.")
+        if result["total"] >= 14:
+            print("\n📦 *Pool vol!* Zeg 'shuffle' om de maaltijden over de dagen te verdelen.")
+    else:
+        print(f"⚠️ {escape_md(result['error'])}")
+
+
+def remove_from_pool(slot_index: int):
+    """Remove a meal from the collecting pool by slot number."""
+    result = remove_meal_from_collection(slot_index)
+    print(result.get("message", "Verwijderd"))
+
+
+def shuffle():
+    """Shuffle collected meals into day assignments."""
+    result = shuffle_and_schedule()
+    if result["success"]:
+        print(result["message"])
+        print("\n")
+        print(fmt_curated_schedule())
+    else:
+        print(f"⚠️ {escape_md(result['error'])}")
+
+
+def show_schedule():
+    """Show current active curated schedule."""
+    print(fmt_curated_schedule())
+
+
+def sunday_prompt():
+    """The Sunday collection prompt — triggered by cron."""
+    cw = get_collecting_week()
+    if not cw:
+        # Auto-start new week
+        next_monday = datetime.date.today() + datetime.timedelta(days=(7 - datetime.date.today().weekday()))
+        from core import start_curated_week
+        wid = start_curated_week(next_monday.isoformat())
+        cw = get_collecting_week()
+    
+    week_start = cw["week_start"]
+    pool = get_curated_pool(cw["id"])
+    
+    lines = [
+        f"📅 *Zondag is plandag*",
+        f"",
+        f"Week van {escape_md(week_start)} — wat eten we?",
+        f"",
+        f"Verzamel {7 - sum(1 for p in pool if p['meal_type']=='lunch')} lunches en {7 - sum(1 for p in pool if p['meal_type']=='dinner')} diners.",
+        f"",
+        f"Typ een nummer of naam, of zeg 'suggestie lunch' voor ideeën.",
+    ]
+    print("\n".join(lines))
+
+
+# --- Pantry helpers -------------------------------------------------------
+
+def pantry_cmd(expiring_only: bool = False):
+    if expiring_only:
+        print(fmt_expiring())
+    else:
+        print(fmt_pantry_summary())
+
+
+def recipe_card(recipe_id: int):
+    r = get_recipe(recipe_id)
+    if not r:
+        print(f"Recept niet gevonden: {recipe_id}")
+        return
+    lines = [
+        f"*🍳 {escape_md(r['name'])}*\n",
+        f"Type: {r['type']} | Keuken: {r['cuisine']}\n",
+        f"Bereidingstijd: {r['prep_time']} + {r['cook_time']} min | Porties: {r['servings']}\n",
+    ]
+    ings = r.get("ingredients", [])
+    if ings:
+        lines.append("\n*Ingrediënten:*")
+        for i in ings:
+            note = f" ({i['prep_note']})" if i.get('prep_note') else ""
+            lines.append(f"  • {i['quantity']}{i['unit']} {escape_md(i['name'])}{note}")
+    print("\n".join(lines))
+
+
+# --- History --------------------------------------------------------------
+
+def ate_cmd(recipe_id: int, servings: int = 4, note: str = ""):
+    log_meal(
+        date=str(datetime.date.today()),
+        meal_type="dinner",
+        recipe_id=recipe_id,
+        servings_eaten=servings,
+        notes=note,
+        logged_by="user"
+    )
+    print("✅ Geregistreerd.")
+
+
+# --- argparse glue --------------------------------------------------------
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Floor's Kitchen Bot")
     sub = parser.add_subparsers(dest="cmd")
 
-    p_menu = sub.add_parser("menu", help="Show week menu")
+    sub.add_parser("remind", help="Today's menu + expiry alert")
+    sub.add_parser("weekly", help="Full week overview")
+    sub.add_parser("shopping", help="Generate shopping list")
+    sub.add_parser("collect", help="Show curated collection pool status")
+    sub.add_parser("shuffle", help="Shuffle collected meals into week schedule")
+    sub.add_parser("schedule", help="Show active week schedule")
+    sub.add_parser("sunday-prompt", help="Sunday collection prompt (cron)")
+    
+    p_suggest = sub.add_parser("suggest", help="Suggest recipes for collection")
+    p_suggest.add_argument("--type", choices=["lunch", "dinner"], help="Meal type filter")
+    p_suggest.add_argument("--cuisine", help="Cuisine filter")
+    
+    p_add = sub.add_parser("add", help="Add recipe to collection pool")
+    p_add.add_argument("recipe_id", type=int, help="Recipe ID")
+    p_add.add_argument("--type", choices=["lunch", "dinner"], required=True, help="Meal type")
+    
+    p_remove = sub.add_parser("remove", help="Remove recipe from pool by slot")
+    p_remove.add_argument("slot", type=int, help="Slot index (0-13)")
+    
+    p_menu = sub.add_parser("menu", help="Legacy: show old plan week menu")
     p_menu.add_argument("--week", type=int, help="Week 1-12")
-
-    p_shop = sub.add_parser("shopping", help="Generate or show shopping list")
-    p_shop.add_argument("--week", type=int, help="Week number")
-    p_shop.add_argument("--list-id", type=int, help="Show existing list")
-
-    p_pantry = sub.add_parser("pantry", help="Show pantry")
-    p_pantry.add_argument("--expiring", action="store_true", help="Show expiring items")
-
-    p_recipe = sub.add_parser("recipe", help="Search or show recipes")
-    p_recipe.add_argument("--query", type=str, help="Search by tag/name")
-    p_recipe.add_argument("--id", type=int, help="Show recipe by ID")
-    p_recipe.add_argument("--type", type=str, choices=["lunch","dinner"], help="Filter by type")
-
-    p_ate = sub.add_parser("ate", help="Log a meal")
+    
+    p_pantry = sub.add_parser("pantry", help="Pantry summary")
+    p_pantry.add_argument("--expiring", action="store_true", help="Only expiring items")
+    
+    p_recipe = sub.add_parser("recipe", help="Show recipe card")
+    p_recipe.add_argument("--id", type=int, required=True, help="Recipe ID")
+    
+    p_ate = sub.add_parser("ate", help="Log a cooked meal")
     p_ate.add_argument("--recipe-id", type=int, required=True)
-    p_ate.add_argument("--meal", type=str, default="dinner", choices=["lunch","dinner"])
-    p_ate.add_argument("--date", type=str)
-    p_ate.add_argument("--servings", type=int, default=1)
-    p_ate.add_argument("--rating", type=int)
+    p_ate.add_argument("--servings", type=int, default=4)
+    p_ate.add_argument("--note", default="")
 
-    p_buy = sub.add_parser("buy", help="Mark items bought")
-    p_buy.add_argument("--item-id", type=int)
-    p_buy.add_argument("--list-id", type=int)
-    p_buy.add_argument("--mark-done", action="store_true")
+    args = parser.parse_args()
 
-    p_remind = sub.add_parser("remind", help="Today's meal reminder")
-    p_weekly = sub.add_parser("weekly", help="Weekly shopping + menu")
-    p_weekly.add_argument("--week", type=int)
-
-    args = parser.parse_args(argv)
-    if not args.cmd or args.cmd not in COMMANDS:
-        parser.print_help()
-        sys.exit(1)
-
-    output = COMMANDS[args.cmd](args)
-
-    # If TELEGRAM_OUTPUT=1, send to Telegram. Otherwise print.
-    if os.getenv("TELEGRAM_OUTPUT") == "1" and args.cmd in ("remind", "weekly", "menu", "shopping", "pantry"):
-        send_msg(output)
+    if args.cmd == "remind":
+        remind()
+    elif args.cmd == "weekly":
+        weekly()
+    elif args.cmd == "shopping":
+        shopping()
+    elif args.cmd == "collect":
+        collect()
+    elif args.cmd == "suggest":
+        suggest(args.type, args.cuisine)
+    elif args.cmd == "add":
+        add_to_pool(args.recipe_id, args.type)
+    elif args.cmd == "remove":
+        remove_from_pool(args.slot)
+    elif args.cmd == "shuffle":
+        shuffle()
+    elif args.cmd == "schedule":
+        show_schedule()
+    elif args.cmd == "sunday-prompt":
+        sunday_prompt()
+    elif args.cmd == "menu":
+        plan = get_active_plan()
+        week = args.week or (get_current_week_number(plan["id"]) if plan else 1)
+        print(fmt_week_menu(week, plan["id"]))
+    elif args.cmd == "pantry":
+        pantry_cmd(args.expiring)
+    elif args.cmd == "recipe":
+        recipe_card(args.id)
+    elif args.cmd == "ate":
+        ate_cmd(args.recipe_id, args.servings, args.note)
     else:
-        print(output)
+        parser.print_help()
+
 
 if __name__ == "__main__":
     main()

@@ -668,8 +668,315 @@ def fmt_expiring() -> str:
         lines.append(f"• {qty} {item['unit']} {item['ingredient_name']} — {days} day{'s' if days != 1 else ''} left")
     return "\n".join(lines)
 
+# =============================================================================
+# CURATED WEEKLY MEALS (interactive, user-driven Sunday curation)
+# =============================================================================
+
+def _monday_of(date: datetime.date = None) -> datetime.date:
+    """Return the Monday of the week containing `date` (defaults to today)."""
+    if date is None:
+        date = datetime.date.today()
+    return date - datetime.timedelta(days=date.weekday())  # Monday=0
+
+def start_curated_week(week_start: str = None) -> int:
+    """Create a new curated week that starts collecting meals. Returns the week_id."""
+    if week_start is None:
+        week_start = _monday_of(datetime.date.today() + datetime.timedelta(days=7)).isoformat()
+    conn = get_conn()
+    cur = conn.execute(
+        "INSERT INTO curated_weeks (week_start, status) VALUES (?, 'collecting')",
+        (week_start,)
+    )
+    week_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return week_id
+
+def get_collecting_week() -> Optional[Dict]:
+    """Find the currently collecting curated week."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM curated_weeks WHERE status = 'collecting' ORDER BY week_start DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def add_meal_to_collection(recipe_id: int, meal_type: str, added_by: str = "user") -> Dict:
+    """Add a recipe to the current collecting week. Returns status."""
+    cw = get_collecting_week()
+    if not cw:
+        # Auto-start one if none exists
+        week_id = start_curated_week()
+        cw = get_collecting_week()
+    week_id = cw["id"]
+    conn = get_conn()
+    
+    # Count how many of this type already
+    count = conn.execute(
+        "SELECT COUNT(*) as c FROM curated_week_meals WHERE week_id = ? AND meal_type = ?",
+        (week_id, meal_type)
+    ).fetchone()["c"]
+    
+    max_per_type = {"lunch": 7, "dinner": 7}
+    if count >= max_per_type.get(meal_type, 7):
+        conn.close()
+        return {"success": False, "error": f"Already have 7 {meal_type} meals. Remove one first."}
+    
+    # Get next slot_index for this type
+    slot = count if meal_type == "lunch" else count + 7
+    
+    conn.execute(
+        """INSERT INTO curated_week_meals (week_id, slot_index, meal_type, recipe_id, added_by)
+           VALUES (?, ?, ?, ?, ?)""",
+        (week_id, slot, meal_type, recipe_id, added_by)
+    )
+    
+    # Check if we hit 14 total
+    total = conn.execute(
+        "SELECT COUNT(*) as c FROM curated_week_meals WHERE week_id = ?",
+        (week_id,)
+    ).fetchone()["c"]
+    
+    status_msg = f"Added. {total}/14 meals collected."
+    if total >= 14:
+        conn.execute(
+            "UPDATE curated_weeks SET status = 'ready' WHERE id = ?",
+            (week_id,)
+        )
+        status_msg = f"✅ Pool full! {total}/14 meals collected. Ready to shuffle."
+    
+    conn.commit()
+    conn.close()
+    return {"success": True, "week_id": week_id, "slot": slot, "total": total, "message": status_msg}
+
+def remove_meal_from_collection(slot_index: int, week_id: int = None) -> Dict:
+    """Remove a meal by slot index from the collecting pool."""
+    cw = get_collecting_week() if week_id is None else None
+    if week_id is None:
+        if not cw:
+            return {"success": False, "error": "No collecting week found."}
+        week_id = cw["id"]
+    conn = get_conn()
+    conn.execute(
+        "DELETE FROM curated_week_meals WHERE week_id = ? AND slot_index = ?",
+        (week_id, slot_index)
+    )
+    # Re-number slots within each type
+    lunches = conn.execute(
+        "SELECT id FROM curated_week_meals WHERE week_id = ? AND meal_type = 'lunch' ORDER BY slot_index",
+        (week_id,)
+    ).fetchall()
+    for i, row in enumerate(lunches):
+        conn.execute("UPDATE curated_week_meals SET slot_index = ? WHERE id = ?", (i, row["id"]))
+    dinners = conn.execute(
+        "SELECT id FROM curated_week_meals WHERE week_id = ? AND meal_type = 'dinner' ORDER BY slot_index",
+        (week_id,)
+    ).fetchall()
+    for i, row in enumerate(dinners):
+        conn.execute("UPDATE curated_week_meals SET slot_index = ? WHERE id = ?", (i + 7, row["id"]))
+    conn.commit()
+    conn.close()
+    return {"success": True, "message": "Meal removed."}
+
+def get_curated_pool(week_id: int = None) -> List[Dict]:
+    """Return all meals in the collecting pool for a week."""
+    conn = get_conn()
+    if week_id is None:
+        cw = get_collecting_week()
+        if not cw:
+            conn.close()
+            return []
+        week_id = cw["id"]
+    rows = conn.execute("""
+        SELECT cwm.slot_index, cwm.meal_type, cwm.recipe_id, r.name as recipe_name,
+               r.cuisine, r.tags, cwm.added_by
+        FROM curated_week_meals cwm
+        LEFT JOIN recipes r ON cwm.recipe_id = r.id
+        WHERE cwm.week_id = ?
+        ORDER BY cwm.meal_type, cwm.slot_index
+    """, (week_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def shuffle_and_schedule(week_id: int = None, strategy: str = "random") -> Dict:
+    """Randomly assign the 14 collected meals to the 7 days × 2 meals.
+       strategy: 'random' or 'balanced' (tries to vary cuisines)."""
+    conn = get_conn()
+    if week_id is None:
+        # Try collecting first, then ready
+        cw = get_collecting_week()
+        if not cw:
+            row = conn.execute(
+                "SELECT id FROM curated_weeks WHERE status = 'ready' ORDER BY week_start DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                conn.close()
+                return {"success": False, "error": "No week ready to shuffle."}
+            week_id = row["id"]
+        else:
+            week_id = cw["id"]
+    
+    pool = conn.execute("""
+        SELECT id, recipe_id, meal_type FROM curated_week_meals
+        WHERE week_id = ?
+        ORDER BY meal_type, RANDOM()
+    """, (week_id,)).fetchall()
+    
+    if len(pool) < 14:
+        conn.close()
+        return {"success": False, "error": f"Only {len(pool)}/14 meals collected. Need all 14 to shuffle."}
+    
+    # Assign to days: slot 0-6 are lunches (Mon-Sun), 7-13 are dinners (Mon-Sun)
+    lunches = [p for p in pool if p["meal_type"] == "lunch"]
+    dinners = [p for p in pool if p["meal_type"] == "dinner"]
+    
+    for day in range(7):
+        # Schedule lunch
+        lunch = lunches[day] if day < len(lunches) else None
+        if lunch:
+            conn.execute("""
+                UPDATE curated_week_meals
+                SET scheduled_day = ?, scheduled_meal_type = 'lunch'
+                WHERE id = ?
+            """, (day, lunch["id"]))
+        # Schedule dinner
+        dinner = dinners[day] if day < len(dinners) else None
+        if dinner:
+            conn.execute("""
+                UPDATE curated_week_meals
+                SET scheduled_day = ?, scheduled_meal_type = 'dinner'
+                WHERE id = ?
+            """, (day, dinner["id"]))
+    
+    conn.execute("UPDATE curated_weeks SET status = 'active', finalized_at = datetime('now') WHERE id = ?", (week_id,))
+    conn.commit()
+    conn.close()
+    return {"success": True, "message": "Shuffled! 14 meals scheduled for the week."}
+
+def get_curated_schedule(week_id: int = None) -> List[Dict]:
+    """Return the active week's day-by-day schedule."""
+    conn = get_conn()
+    if week_id is None:
+        row = conn.execute(
+            "SELECT id FROM curated_weeks WHERE status = 'active' ORDER BY week_start DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            conn.close()
+            return []
+        week_id = row["id"]
+    rows = conn.execute("""
+        SELECT 
+            cw.id as week_id, cw.week_start, cw.status,
+            cwm.scheduled_day,
+            CASE cwm.scheduled_day
+                WHEN 0 THEN 'Mon' WHEN 1 THEN 'Tue' WHEN 2 THEN 'Wed'
+                WHEN 3 THEN 'Thu' WHEN 4 THEN 'Fri' WHEN 5 THEN 'Sat' WHEN 6 THEN 'Sun'
+            END as day_name,
+            cwm.scheduled_meal_type as meal_type,
+            r.id as recipe_id, r.name as recipe_name,
+            r.cuisine, r.prep_time, r.cook_time,
+            cwm.cooked, cwm.skipped
+        FROM curated_weeks cw
+        JOIN curated_week_meals cwm ON cw.id = cwm.week_id
+        LEFT JOIN recipes r ON cwm.recipe_id = r.id
+        WHERE cw.id = ? AND cwm.scheduled_day IS NOT NULL
+        ORDER BY cwm.scheduled_day,
+                 CASE cwm.scheduled_meal_type WHEN 'lunch' THEN 0 ELSE 1 END
+    """, (week_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def fmt_curated_pool() -> str:
+    """Telegram-formatted pool status."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM curated_weeks WHERE status IN ('collecting', 'ready') ORDER BY week_start DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return "📭 No active meal collection. Start one with `/collect` or say 'Start collecting meals'."
+    
+    cw = dict(row)
+    pool = get_curated_pool(cw["id"])
+    lines = [f"📦 *Collecting Week Starting {cw['week_start']}*", f"\n{len(pool)}/14 meals in the pool.\n"]
+    lunches = [p for p in pool if p["meal_type"] == "lunch"]
+    dinners = [p for p in pool if p["meal_type"] == "dinner"]
+    
+    lines.append("*🥪 Lunches:*")
+    for i, m in enumerate(lunches, 1):
+        name = m["recipe_name"] or "TBD"
+        lines.append(f"  {i}. {name}")
+    lines.append(f"  _(need {7 - len(lunches)} more)_")
+    
+    lines.append("\n*🍽 Dinners:*")
+    for i, m in enumerate(dinners, 1):
+        name = m["recipe_name"] or "TBD"
+        lines.append(f"  {i}. {name}")
+    lines.append(f"  _(need {7 - len(dinners)} more)_")
+    
+    if len(pool) >= 14:
+        lines.append("\n✅ *Pool full! Say 'shuffle' to assign meals to days.*")
+    
+    return "\n".join(lines)
+
+def fmt_curated_schedule() -> str:
+    """Telegram-formatted active schedule."""
+    schedule = get_curated_schedule()
+    if not schedule:
+        return "📭 No active schedule. Collect 14 meals and shuffle first."
+    lines = [f"📅 *Week of {schedule[0]['week_start']}*", ""]
+    DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    for day_num in range(7):
+        day_meals = [m for m in schedule if m["scheduled_day"] == day_num]
+        if not day_meals:
+            continue
+        day_label = DAYS[day_num]
+        lines.append(f"*{day_label}*")
+        for m in day_meals:
+            icon = "🥪" if m["meal_type"] == "lunch" else "🍽"
+            status = "✅" if m["cooked"] else ""
+            name = m["recipe_name"] or "TBD"
+            lines.append(f"  {icon} {name} {status}")
+        lines.append("")
+    return "\n".join(lines)
+
+def advance_week() -> Dict:
+    """Close current week and start a new one. Called by cron or user."""
+    conn = get_conn()
+    # Archive old active weeks
+    conn.execute(
+        "UPDATE curated_weeks SET status = 'past' WHERE status = 'active'"
+    )
+    # Close collecting weeks too
+    conn.execute(
+        "UPDATE curated_weeks SET status = 'ready' WHERE status = 'collecting' AND id NOT IN (SELECT MAX(id) FROM curated_weeks)"
+    )
+    conn.commit()
+    conn.close()
+    
+    # Start new collection for next week
+    next_monday = _monday_of(datetime.date.today() + datetime.timedelta(days=7))
+    week_id = start_curated_week(next_monday.isoformat())
+    return {"success": True, "week_id": week_id, "week_start": next_monday.isoformat(), "message": f"New week collection started: {next_monday.isoformat()}"}
+
+def list_all_recipes_for_selection(meal_type: str = None, tag_filter: str = None) -> List[Dict]:
+    """Return recipes suitable for showing to the user during collection."""
+    conn = get_conn()
+    sql = "SELECT id, name, type, cuisine, tags, prep_time, cook_time FROM recipes WHERE active = 1"
+    params = []
+    if meal_type:
+        sql += " AND type = ?"
+        params.append(meal_type)
+    if tag_filter:
+        sql += " AND tags LIKE ?"
+        params.append(f"%{tag_filter}%")
+    sql += " ORDER BY type, name"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
 # ---------------------------------------------------------------------------
-# CLI convenience
+# CLI convenience (extended)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
